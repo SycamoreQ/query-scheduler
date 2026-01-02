@@ -67,5 +67,16 @@ impl NatsEventBroker{
             
     }
     
+    async fn create_gpu_consumer(js: &async_nats::jetstream::Context) -> PullConsumer {
+        let stream = js.get_stream("JOBS_STREAM").await.expect("Stream must exist");
+        
+        stream.get_or_create_consumer("gpu_worker_group", async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some("gpu_worker_group".to_string()),
+            // If the GPU crashes, NATS will wait 30s before giving these jobs to another GPU
+            ack_wait: Duration::from_secs(30), 
+            ..Default::default()
+        }).await.expect("Failed to create consumer")
+    }
+    
     
 }
