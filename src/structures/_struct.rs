@@ -1,30 +1,9 @@
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Metadata;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use serde::{Serialize, Deserialize};
-use chrono::{DateTime, Utc, Duration};
-use serde_json::Value as Metadata;
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResearchDomain {
-    #[serde(rename = "cs")] ComputerScience,
-    Physics,
-    Biology,
-    Math,
-    Chemistry,
-    Medicine,
-    Engineering, 
-    General,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum QueryPriority {
-    Low = 1,
-    Medium = 2,
-    High = 3,
-    Critical = 4,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,11 +16,17 @@ pub enum CoalescePolicy {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Trigger {
-    Cron { expression: String, timezone: String },
-    Interval { seconds: u64 },
-    Date { run_at: DateTime<Utc> },
+    Cron {
+        expression: String,
+        timezone: String,
+    },
+    Interval {
+        seconds: u64,
+    },
+    Date {
+        run_at: DateTime<Utc>,
+    },
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Query<'a> {
@@ -73,6 +58,25 @@ impl<'a> Task<'a> {
             max_running_jobs: 0,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MLTask {
+    pub id: String,
+    pub task_type: MLTaskType,
+    pub model_type: ModelType,
+    pub min_resources: ResourceRequirement,
+    pub arrival_time: DateTime<Utc>,
+    pub completion_time: Option<Duration>,
+    pub progress: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResourceRequirement {
+    pub cpu_cores: usize,
+    pub gpu_count: usize,
+    pub gpu_memory_mb: usize,
+    pub memory_mb: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
