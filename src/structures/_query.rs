@@ -50,35 +50,33 @@ pub enum operations {
     traverse,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Constraint {
-    field(String),
-    operator = vec![
-        "equals",
-        "contains",
-        "greater_than",
-        "less_than",
-        "between",
-        "in_list",
-    ],
-    value(Any),
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum Operator {
+    Equals,
+    Contains,
+    GreaterThan,
+    LessThan,
+    InList,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum Constraint {
+    Field(Vec<ResearchDomain>),
+    Venue(String, Operator),
+    Author(String, Operator),
+    PaperTitle(String, Operator),
+    CitationCount(usize, Operator), // Example: CitationCount(50, Operator::GreaterThan)
+    AuthorCount(usize, Operator),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct QueryIntent {
-    pub author: Optional<String>,
-    pub paper_title: Optional<String>,
-    pub venue: Optiona<String>,
-    pub field_of_study: Optional<ResearchDomain>,
-    pub min_citation_count: Optional<usize>,
-    pub max_citation_count: Optional<usize>,
-    pub min_author_count: Optional<usize>,
-    pub sort_by: Optional<String>,
-    pub limit: Optional<String>,
-    pub operation: Optiona<operations>,
-    pub priority: Optional<QueryPriority>,
-    pub target_entity: Optional<target_entity>,
-    pub constraint: Optional<Constraint>,
+    pub operation: Option<Operations>,
+    pub priority: Option<QueryPriority>,
+    pub target_entity: Option<TargetEntity>,
+    pub constraints: Vec<Constraint>,
+    pub sort_by: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -504,9 +502,6 @@ impl ComplexityCalculator{
             return 1.0;
         }
         
-        // Join cost models [web:16]
-        // WCO Join: cost = card(V1..Vk-1) * |edges| / |vertices|
-        // Binary Join: 2*min(card(V1), card(V2)) + max(card(V1), card(V2))
         
         let base_join_cost = match join_count {
             1 => 2.0,
@@ -526,7 +521,6 @@ impl ComplexityCalculator{
         base_join_cost * expensive_multiplier
     }
     
-    // FINAL COMPLEXITY SCORE
     pub async fn get_final_complexity_score(
         &self,
         query_intent: &QueryIntent
@@ -536,13 +530,10 @@ impl ComplexityCalculator{
     }
 }
 
-// Priority-based weight adjustment
 impl ComplexityCalculator {
     pub fn adjust_weights_for_priority(&mut self, priority: QueryPriority) {
         match priority {
             QueryPriority::Critical => {
-                // Critical queries should execute fastest
-                // Lower weights = lower perceived complexity = higher priority
                 self.weights.data_volume *= 0.7;
                 self.weights.computation *= 0.7;
             }
@@ -558,7 +549,5 @@ impl ComplexityCalculator {
             _ => {}
         }
     }
-    
-    
-    
+  
 }
