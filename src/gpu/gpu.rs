@@ -39,23 +39,6 @@ pub struct GPU {
 #[derive(Debug, Deserialize, Serialize, Clone, Eq)]
 pub struct GPUs;
 
-#[derive(Default , Clone , Debug)]
-pub struct EdgeCluster { 
-    pub id: usize , 
-    pub cpu_cores: ResourceState, 
-    pub gpus: Vec<GPU>,
-    pub memory_mb: ResourceState,
-    pub bandwidth_mbps: f64,
-    pub pending_tasks: VecDeque<Task>,
-    pub running_tasks: Vec<Task>,
-}
-
-#[derive(Debug , Clone , Default)]
-pub struct ResourceState{ 
-    pub total: usize,
-    pub available: usize
-}
-
 pub trait GPUsFunction {
     pub fn String(&self) -> String;
     pub fn Trade(
@@ -241,7 +224,6 @@ impl GPUsFunction for GPUs {
         Ok(())
     }
 
-    /// Cancel: Reverses an allocation (backtracking/removal).
     fn Cancel(&mut self, option: &GPUOption) -> Result<(), String> {
         debug!("Cancel option {:?} on GPU {:?}", option, self);
 
