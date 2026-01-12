@@ -1,26 +1,61 @@
 [package]
-name = "queryscheduler"
+name = "tapfinger"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-async-nats = "0.45.0"
-bisection = "0.1.0"
-chrono = "0.4.42"
-dspy-rs = "0.7.3"
-good_lp = "1.14.2"
-k8s-openapi = "0.26.1"
-kube = "2.0.1"
-nats = "0.25.0"
-neo4rs = "0.8.0"
-petgraph = "0.8.3"
-ractor = "0.15.10"
-serde = "1.0.228"
-strum = "0.27.2"
-strum_macros = "0.27.2"
-surrealdb = "2.4.0"
-tch = "0.22.0"
-tokio = "1.48.0"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.22"
-uuid = "1.19.0"
+# Deep Learning - Core requirement
+tch = "0.0.4"
+
+# Async Runtime - Core requirement
+tokio = { version = "1.35", features = ["full"] }
+
+# Graph Processing - Core requirement
+petgraph = "0.6"
+
+# Serialization - Core requirement
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Array Operations - Core requirement
+ndarray = "0.15"
+
+# Monitoring - Core requirement
+prometheus = { version = "0.13", features = ["process"] }
+warp = "0.3"
+
+# Utilities - Core requirement
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+anyhow = "1.0"
+rayon = "1.8"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Optional: Only needed for actual Kubernetes deployment
+# Comment these out for now - you can add them later when deploying
+# k8s-openapi = { version = "0.20", features = ["v1_28"], optional = true }
+# kube = { version = "0.87", features = ["runtime", "derive"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.8"
+
+[features]
+default = []
+# Uncomment this when you want Kubernetes support
+# kubernetes = ["k8s-openapi", "kube"]
+
+[[bin]]
+name = "tapfinger"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1  # Faster compilation in debug mode
