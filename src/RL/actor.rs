@@ -1,5 +1,5 @@
 use crate::han::HANOutput;
-use tch::{Device, Kind, Tensor, nn, nn::Module};
+use tch::{nn, nn::Module, Device, Kind, Tensor};
 
 pub struct TapFingerActor {
     pub task_selection: nn::Sequential,
@@ -183,24 +183,30 @@ impl TapFingerActor {
             resource_allocation,
         }
     }
-    
+
     fn extract_cluster_embedding(&self, full_embedding: &Tensor, graph: &GraphTensors) -> Tensor {
         if graph.cluster_indices.is_empty() {
-            return Tensor::zeros(&[1, self.hidden_dim], (Kind::Float, full_embedding.device()));
+            return Tensor::zeros(
+                &[1, self.hidden_dim],
+                (Kind::Float, full_embedding.device()),
+            );
         }
-        
-        let cluster_idx = Tensor::of_slice(&graph.cluster_indices[0..1])
-            .to_device(full_embedding.device());
+
+        let cluster_idx =
+            Tensor::of_slice(&graph.cluster_indices[0..1]).to_device(full_embedding.device());
         full_embedding.index_select(0, &cluster_idx)
     }
-    
+
     fn extract_pending_embeddings(&self, full_embedding: &Tensor, graph: &GraphTensors) -> Tensor {
         if graph.pending_indices.is_empty() {
-            return Tensor::zeros(&[0, self.hidden_dim], (Kind::Float, full_embedding.device()));
+            return Tensor::zeros(
+                &[0, self.hidden_dim],
+                (Kind::Float, full_embedding.device()),
+            );
         }
-        
-        let pending_idx = Tensor::of_slice(&graph.pending_indices)
-            .to_device(full_embedding.device());
+
+        let pending_idx =
+            Tensor::of_slice(&graph.pending_indices).to_device(full_embedding.device());
         full_embedding.index_select(0, &pending_idx)
     }
 }
@@ -212,7 +218,7 @@ pub struct ActionMask {
     pub memory_mask: Tensor,
 }
 
-impl ActionMask{ 
+impl ActionMask {
     pub fn new(
         num_pending: i64,
         num_cpu_bins: i64,
@@ -227,46 +233,107 @@ impl ActionMask{
             memory_mask: Tensor::zeros(&[num_memory_bins], (Kind::Float, device)),
         }
     }
-    
-    pub fn mask_task(&mut self , task_idx: String){ 
+
+    pub fn mask_task(&mut self, task_idx: String) {
         let _ = self.task_mask.get(task_idx).fill_(f64::NEG_INFINITY);
     }
-    
-    pub fn mask_cpu(&mut self , cpu_idx: String){
+
+    pub fn mask_cpu(&mut self, cpu_idx: String) {
         let _ = self.task_mask.get(cpu_idx).fill_(f64::NEG_INFINITY);
     }
-    
-    pub fn from_environment(
-        env: &EdgeMLEnv,
-        cluster_id: usize,
-        device: Device,
-    ) -> Self {
+
+    pub fn from_environment(env: &EdgeMLEnv, cluster_id: usize, device: Device) -> Self {
         let cluster = &env.clusters[cluster_id];
         let num_pending = cluster.pending_tasks.len() as i64;
-        
+
         let mut mask = Self::new(num_pending, 17, 8, 20, device);
-        
+
         // Mask tasks that don't fit in available resources
         for (i, task) in cluster.pending_tasks.iter().enumerate() {
-            if task.min_cpu > cluster.cpu_cores.available ||
-               task.min_gpu_core > cluster.gpus.iter().map(|g| g.CoreAvailable).sum() {
+            if task.min_cpu > cluster.cpu_cores.available
+                || task.min_gpu_core > cluster.gpus.iter().map(|g| g.CoreAvailable).sum()
+            {
                 mask.mask_task(i as i64 + 1);
             }
         }
-        
+
         // Mask CPU allocations beyond available
         let available_cpu = cluster.cpu_cores.available as i64;
         for cpu in (available_cpu + 1)..17 {
             mask.mask_cpu(cpu);
         }
-        
-        
-        
-        
         mask
     }
-    
-    
+
+    pub fn get_valid_candidates(
+        &self,
+        cluster_res: &ClusterResources,
+        task_lookup: &TaskLookup,
+    ) -> Vec<ActionKey> {
+        let mut candidates = Vec::new();
+
+        candidates.push(ActionKey {
+            task_idx: 0,
+            cpu_bin: 0,
+            gpu_idx: 0,
+            mem_bin: 0,
+        });
+
+        let mask_vec: Vec<f32> = self
+            .task_mask
+            .shallow_clone()
+            .try_into()
+            .unwrap_or_default();
+        for (idx, &mask_val) in mask_vec.iter().enumerate().skip(1) {
+            if mask_val < 0.0 {
+                continue;
+            }
+
+            let task_idx = idx as f64;
+
+            let info = match task_lookup.get(&task_idx) {
+                Some(i) => i,
+                None => continue,
+            };
+
+            for &cpu_usage in &[info.min_cpu as i64, cluster_res.cpu_available as i64] {
+                for (gpu_id, &gpu_cores) in cluster_res.gpu_available_cores.iter().enumerate() {
+                    if gpu_cores > info.min_gpu_cores {
+                        candidates.push(ActionKey {
+                            task_idx,
+                            cpu_bin: cpu_usage,
+                            gpu_idx: gpu_id,
+                            mem_bin: info.min_memory as i64,
+                        });
+                    }
+                }
+            }
+        }
+
+        candidates
+    }
+
+    pub fn to_tensor(&self, device: Device) -> Tensor {
+        let data = vec![
+            self.task_idx as f32,
+            self.cpu_bin as f32 / 16.0,
+            self.gpu_idx as f32 / 8.0,
+            self.mem_bin as f32 / 20.0,
+        ];
+
+        Tensor::from_slice(&data)
+            .to_device(device)
+            .to_kind(Kind::Float)
+    }
+
+    pub fn no_op() -> Self {
+        Self {
+            task_idx: 0,
+            cpu_bin: 0,
+            gpu_idx: 0,
+            mem_bin: 0,
+        }
+    }
 }
 
 pub struct ActorOutput {

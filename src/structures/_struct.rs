@@ -60,25 +60,6 @@ impl<'a> Task<'a> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MLTask {
-    pub id: String,
-    pub task_type: MLTaskType,
-    pub model_type: ModelType,
-    pub min_resources: ResourceRequirement,
-    pub arrival_time: DateTime<Utc>,
-    pub completion_time: Option<Duration>,
-    pub progress: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ResourceRequirement {
-    pub cpu_cores: usize,
-    pub gpu_count: usize,
-    pub gpu_memory_mb: usize,
-    pub memory_mb: usize,
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Schedule<'a> {
     pub id: Cow<'a, str>,
@@ -170,10 +151,10 @@ pub enum JobOutcome {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JobResult {
-    pub job_id: String, // Or uuid::Uuid
+    pub job_id: String,
     pub outcome: JobOutcome,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
-    pub return_value: Option<Metadata>, // Dynamic return value
+    pub return_value: Option<Metadata>,
     pub exception: Option<String>,
 }

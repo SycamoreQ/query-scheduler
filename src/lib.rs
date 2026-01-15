@@ -36,4 +36,4 @@ pub mod utils {
 // Re-exports for convenience
 pub use structures::_graph::HAN;
 pub use RL::env::EdgeMLEnv;
-pub use RLL::mappo::MAPPOTrainer;
+pub use RL::mappo::MAPPOTrainer;

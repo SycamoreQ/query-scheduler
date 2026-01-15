@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tch::{Device, IndexOp, Kind, Tensor, nn};
+use tch::{nn, Device, IndexOp, Kind, Tensor};
 
 pub struct ScatterGather;
 

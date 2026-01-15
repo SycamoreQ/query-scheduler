@@ -16,18 +16,37 @@ pub struct EdgeMLEnv {
 #[derive(Clone, Debug)]
 pub struct EdgeCluster {
     pub id: usize,
-    pub cpu_cores: ResourceState,
+    pub cpus: Vec<CPU>,
     pub gpus: Vec<GPU>,
-    pub memory_mb: ResourceState,
+    pub memory_mb: usize,
     pub bandwidth_mbps: f64,
     pub pending_tasks: VecDeque<MLTask>,
     pub running_tasks: Vec<RunningTask>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ResourceState {
-    pub total: usize,
-    pub available: usize,
+pub struct SchedulingContext {
+    pub graph: GraphTensors,
+    pub task_lookup: TaskLookup,
+    pub cluster_resources: ClusterResources,
+}
+
+pub struct TaskLookup {
+    tasks: HashMap<i64, TaskInfo>,
+}
+
+pub struct TaskInfo {
+    pub task_id: String,
+    pub min_cpu: usize,
+    pub min_gpu_core: usize,
+    pub min_gpu_memory: usize,
+    pub min_memory_mb: usize,
+    pub task_type: MLTaskType,
+}
+
+pub struct ClusterResources {
+    pub cpu_available: usize,
+    pub gpu_available: Vec<usize>,
+    pub memory_available: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +56,27 @@ pub struct GPU {
     pub core_total: usize,
     pub memory_available_mb: usize,
     pub memory_total_mb: usize,
+}
+
+#[derive(Debug , Clone)]
+pub struct CPU{
+    pub id: usize,
+    pub core_available: usize,
+    pub core_total: usize,
+    pub memory_available_mb: usize,
+    pub memory_total_mb: usize,
+}
+
+impl CPU{
+    pub fn new(id: String) -> Self{
+        Self{
+            id,
+            core_available: 100,
+            core_total: 100,
+            memory_available: 16000,
+            memory_total_mb: 16000,
+        }
+    }
 }
 
 impl GPU {
@@ -87,6 +127,7 @@ pub struct ResourceSensitivity {
     pub memory_scaling: f32,
 }
 
+
 #[derive(Clone, Debug)]
 pub struct RunningTask {
     pub task: MLTask,
@@ -100,6 +141,7 @@ pub struct RunningTask {
 
 #[derive(Clone, Debug)]
 pub struct CompletedTask {
+    pub task: MLTask,
     pub task_id: String,
     pub cluster_id: usize,
     pub arrival_time: DateTime<Utc>,
@@ -147,6 +189,81 @@ impl EdgeMLEnv {
             completed_tasks: Vec::new(),
             config,
             rng: rand::thread_rng(),
+        }
+    }
+
+    pub fn build_obs(&self) -> SchedulingContext{
+        let mut graph = HanGraph::new();
+        let mut task_lookup = TaskLookup::new();
+        let mut cluster_resources = ClusterResources::default();
+
+        for (cluster_idx , cluster) in self.clusters.iter().enumerate(){
+            for task in &cluster.pending_tasks{
+                let node_idx = graph.add_pending_task(task.to_features()); //Need to add this into Graph struct 
+                task_lookup.insert(node_idx, TaskInfo {
+                    task_id: task.id.clone(),
+                    min_cpu: task.min_cpu,
+                    min_gpu_core: task.min_gpu_core,
+                    min_gpu_memory: task.min_gpu_memory,
+                    min_memory_mb: task.min_memory_mb,
+                    task_type: task.task_type,
+                });
+            }
+            cluster_resources.cpu_available = cluster.cpus.iter()
+                .enumerate()
+                .filter(|(_, c)| c.core_available > 0)
+                .map(|(i , _)| i)
+                .collect();
+            
+            cluster_resources.gpu_available = cluster.gpus.iter()
+                .enumerate()
+                .filter(|(_, g)| g.core_available > 0)
+                .map(|(i, _)| i)
+                .collect();
+            
+            cluster_resources.memory_available = cluster.memory_mb
+            }
+            
+            SchedulingContext {
+                graph: graph.to_tensor(device),
+                task_lookup,
+                cluster_resources,
+            }
+        }
+    }
+    
+    pub fn build_scheduling_context(&self , cluster_idx: usize) -> SchedulingContext{
+        let mut graph = HANGraph::new();
+        let mut task_lookup = HashMap::new();
+        let cluster = &self.clusters[cluster_idx];
+        
+        let cluster_to_node_idx = graph.add_cluster(cluster.to_features()) as i64; 
+        
+        let cluster_resources = ClusterResources{
+            cpu_available: cluster.cpu_cores.available,
+            gpu_available: cluster.gpus.iter().map(|g| g.core_available).collect(),
+            memory_available: cluster.memory_mb.available,
+        };
+        
+        for task in cluster.pending_task.iter().take(self.config.max_pending_set_size){
+            let node_idx = graph.add_pending_task(task.to_features()) as i64;
+            
+            task_lookup.insert(node_idx, TaskInfo {
+                task_id: task.id.clone(),
+                min_cpu: task.min_cpu,
+                min_gpu_core: task.min_gpu_core,
+                min_gpu_memory: task.min_gpu_memory,
+                min_memory_mb: task.min_memory_mb,
+                task_type: task.task_type,
+            });
+                        
+            graph.connect_task_to_cluster(node_idx as usize, cluster_node_idx as usize);
+        }
+        
+        SchedulingContext {
+            graph: graph.to_tensors(), // Convert graph to tch::Tensors
+            task_lookup: TaskLookup { tasks: task_lookup },
+            cluster_resources,
         }
     }
 
