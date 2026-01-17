@@ -182,6 +182,10 @@ pub struct MCTSNode {
     pub prior_prob: f64,
     // Which action led to this node
     pub action: Option<ActionKey>,
+    //Stores immediate reward given by the world model
+    pub reward: f64,
+    //accumulated value (reward + gamma*value)
+    pub total_value: f64,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -222,28 +226,30 @@ impl ActionKey {
         ])
         .to_device(device)
     }
-
-    pub fn is_valid(&self, task_info: &TaskInfo, cluster: &ClusterResources) -> bool {
-        // 1. Check if task selection is "No-Op" (always valid)
+    pub fn is_valid(&self, info: &TaskInfo, cluster: &ClusterResources) -> bool {
         if self.task_idx == 0 {
             return true;
-        }
+        } // No-op is always valid
 
-        // 2. Validate CPU: Bin must be >= task minimum AND <= cluster available
-        let cpu_req = self.cpu_bin as usize;
-        if cpu_req < task_info.min_cpu || cpu_req > cluster.cpu_available {
+        // CPU Check
+        if (self.cpu_bin as usize) < info.min_cpu || self.cpu_bin as usize > cluster.cpu_available {
             return false;
         }
 
-        // 3. Validate GPU: Check if the specific GPU has enough cores/memory
-        if let Some(gpu) = cluster.gpus.get(self.gpu_idx as usize) {
-            if (self.gpu_cores_bin as usize) < task_info.min_gpu_core
-                || (self.gpu_cores_bin as usize) > gpu.core_available
-            {
+        // GPU Check: Check the specific GPU index chosen
+        if let Some(&available_cores) = cluster.gpu_available.get(self.gpu_idx as usize) {
+            if available_cores < info.min_gpu_core {
                 return false;
             }
         } else {
-            return false; // GPU index out of bounds
+            return false; // Invalid GPU index
+        }
+
+        // Memory Check
+        if (self.mem_bin as usize) < info.min_memory_mb
+            || self.mem_bin as usize > cluster.memory_available
+        {
+            return false;
         }
 
         true
@@ -300,12 +306,20 @@ impl MCTSNode {
     pub fn add_child(
         &mut self,
         action: ActionKey,
-        child: MCTSNode,
+        child_latent: Tensor,
         prior: f64,
+        reward: f64,
     ) -> Arc<Mutex<MCTSNode>> {
-        let mut child = child;
-        child.action = Some(action.clone());
-        child.prior_prob = prior;
+        let child = MCTSNode {
+            latent_state: child_latent,
+            parent: None,
+            children: HashMap::new(),
+            reward,
+            visit_count: 0,
+            total_value: 0.0,
+            prior_prob: prior,
+            action: Some(action.clone()),
+        };
 
         let child_ref = Arc::new(Mutex::new(child));
         self.children.insert(action, Arc::clone(&child_ref));
@@ -413,15 +427,18 @@ impl MCTS {
                 // Predict next state using world model
                 let action_tensor = action.to_tensor(device);
                 let output = self.world_model.step(&latent_state, &action_tensor);
+                let pred_reward = f64::try_from(&output.reward).unwrap_or(0.0);
 
                 // Create child node
                 let child = MCTSNode::new(output.next_latent_state);
 
                 // Store the predicted reward from the World Model into the edge
-                current
-                    .lock()
-                    .unwrap()
-                    .add_child(action, child, prob, output.reward);
+                current.lock().unwrap().add_child(
+                    action,
+                    output.next_latent_state,
+                    prob,
+                    pred_reward,
+                );
             }
 
             // Select one child to continue
@@ -432,13 +449,15 @@ impl MCTS {
         }
 
         // Evaluation: rollout or use value network
-        let value = self.evaluate(&current);
+        let mut value = self.evaluate(&current);
 
-        // Backpropagation: update all nodes in path
-        for (node, _) in path.iter().rev() {
-            node.lock().unwrap().backpropagate(value);
+        // Backpropagate using the stored rewards on each edge
+        for (node_arc, _) in path.iter().rev() {
+            let mut node = node_arc.lock().unwrap();
+            // The value at this node is its reward + discounted future value
+            value = node.reward + (self.gamma * value);
+            node.backpropagate(value);
         }
-        current.lock().unwrap().backpropagate(value);
     }
 
     /// Evaluate a node using value network or rollout
