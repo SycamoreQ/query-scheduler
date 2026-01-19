@@ -3,6 +3,8 @@ use std::f64;
 use std::sync::{Arc, Mutex};
 use tch::{nn, Device, IndexOp, Kind, Tensor};
 
+const N_TASKS: usize = 100;
+
 pub struct WorldModel {
     representation_net: nn::Sequential,
     // Dynamics: predicts next latent state from current latent state + action
@@ -32,6 +34,13 @@ impl WorldModel {
                 Default::default(),
             ))
             .add_fn(|x| x.tanh()); // Bounded latent space
+
+        let action_net = nn::seq().add(nn::linear(
+            vs / "act_1",
+            action_dim,
+            hidden_dim / 4,
+            default::Default,
+        ));
 
         // Dynamics: (latent_state, action) → next_latent_state
         let dynamics_net = nn::seq()
@@ -101,10 +110,26 @@ impl WorldModel {
     }
 
     /// Full step: predict (next_state, reward, value)
-    pub fn step(&self, latent_state: &Tensor, action: &Tensor) -> WorldModelOutput {
-        let next_latent = self.predict_next(latent_state, action);
-        let reward = self.predict_reward(&next_latent);
-        let value = self.predict_value(&next_latent);
+    pub fn step(&self, latent_state: &Tensor, action: &ActionKey) -> WorldModelOutput {
+        let device = latent_state.device();
+
+        // Normalize bins by their max range so they are in [0, 1] range
+        let action_data = vec![
+            action.task_idx as f32 / N_TASKS,
+            action.cpu_bin as f32 / 16.0,
+            action.gpu_idx as f32 / 8.0,
+            action.mem_bin as f32 / 20.0,
+        ];
+        let action_tensor = Tensor::from_slice(&action_data).to_device(device);
+
+        // 2. Predict Next State
+        let action_proj = self.action_encoder.forward(&action_tensor);
+        let dyn_input = Tensor::cat(&[latent_state, &action_proj], -1);
+        let next_latent = self.dynamics_net.forward(&dyn_input);
+
+        // 3. Predict Reward and Value
+        let reward = self.reward_net.forward(&next_latent);
+        let value = self.value_net.forward(&next_latent);
 
         WorldModelOutput {
             next_latent_state: next_latent,
@@ -245,7 +270,7 @@ impl ActionKey {
             return false; // Invalid GPU index
         }
 
-        // Memory Check
+        // Memory Checo
         if (self.mem_bin as usize) < info.min_memory_mb
             || self.mem_bin as usize > cluster.memory_available
         {
