@@ -138,7 +138,7 @@ impl PostgresStorage {
 
 #[async_trait::async_trait]
 impl StorageLayer for PostgresStorage {
-    pub async fn store_job(&self, job: &JobRecord) -> Result<i64> {
+    async fn store_job(&self, job: &JobRecord) -> Result<i64> {
         let rec = sqlx::query!(
             r#"
             INSERT INTO jobs (
@@ -171,7 +171,7 @@ impl StorageLayer for PostgresStorage {
         Ok(rec.id)
     }
 
-    pub async fn update_job_status(&self, job_id: &str, status: &str) -> Result<()> {
+    async fn update_job_status(&self, job_id: &str, status: &str) -> Result<()> {
         let rec = sqlx::query!(
             r#"
             UPDATE jobs SET status = $1 WHERE job_id = $2
@@ -184,7 +184,7 @@ impl StorageLayer for PostgresStorage {
         Ok(())
     }
 
-    pub async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
+    async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let job = sqlx::query_as!(
             JobRecord,
             r#"
@@ -196,4 +196,124 @@ impl StorageLayer for PostgresStorage {
         .await?;
         Ok(job)
     }
+
+    async fn store_metrics(&self, metrics: &ClusterMetrics) -> Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO cluster_metrics (
+                cluster_id, timestamp, cpu_utilization, gpu_utilization,
+                memory_utilization, queue_length, active_jobs, throughput
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+            metrics.cluster_id,
+            metrics.timestamp,
+            metrics.cpu_utilization,
+            metrics.gpu_utilization,
+            metrics.memory_utilization,
+            metrics.queue_length,
+            metrics.active_jobs,
+            metrics.throughput,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_recent_metrics(
+        &self,
+        cluster_id: i32,
+        limit: i64,
+    ) -> Result<Vec<ClusterMetricsd>> {
+        let metrics = sqlx::query_as!(
+            ClusterMetrics,
+            r#"
+             SELECT * FROM cluster_metrics
+             WHERE cluster_id = $1
+             ORDER BY timestamp DESC
+             LIMIT $2
+             "#,
+            cluster_id,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(metrics)
+    }
+}
+
+pub struct CacheStorage {
+    client: RedisClient,
+    ttl_seconds: i64,
+    cache_type: String, // "valkey"
+}
+
+impl CacheStorage {
+    /// - Valkey: `valkey://localhost:6379` (Linux Foundation, truly open source)
+    pub async fn new(cache_url: &str, ttl_seconds: i64) -> Result<Self> {
+        // Detect cache type from URL
+        let cache_type = if cache_url.starts_with("valkey://") {
+            "valkey"
+        };
+
+        // Fred supports Redis protocol, which Valkey/DragonflyDB/KeyDB all implement
+        let config = RedisConfig::from_url(cache_url)?;
+        let client = RedisClient::new(config, None, None, None);
+        client.connect();
+        client.wait_for_connect().await?;
+
+        println!("Connected to {} cache", cache_type);
+
+        Ok(Self {
+            client,
+            ttl_seconds,
+            cache_type: cache_type.to_string(),
+        })
+    }
+
+    pub async fn store_mcts_node(&self, node: &MCTSNodeData) -> Result<()> {
+        let key = format!("mcts_node_id:{}", &node.id);
+        let value = serde_json::to_string(node);
+
+        self.client
+            .set(
+                &key,
+                value,
+                Some(Expiration::EX(self.ttl_seconds)),
+                None,
+                false,
+            )
+            .await?;
+        if let Some(parent_id) = &node.parent_id {
+            let parent_children_key = format!("mcts:children:{}", parent_id);
+            self.client
+                .sadd(&parent_children_key, &node.node_id)
+                .await?;
+            self.client
+                .expire(&parent_children_key, self.ttl_seconds)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_mcts_node(&self, node_id: &str) -> Result<Option<MCTSNodeData>> {
+        let key = format!("mcts:node:{}", node_id);
+        let value: Option<String> = self.client.get(&key).await?;
+
+        match value {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_children_node(&self , parent_id: &str) -> Result<Option<MCTSNodeData>>{
+        let key = format!("mcts.parentnode{}" , parent_id);
+        let value: Vec<String> = self.client.smembers(&key).await?;
+        Ok(value)
+    }
+
+    pub async fn
+
+
 }
