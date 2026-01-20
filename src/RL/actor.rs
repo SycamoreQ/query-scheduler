@@ -1,9 +1,9 @@
-use crate::han::HANOutput;
 use tch::{nn, nn::Module, Device, Kind, Tensor};
 
 pub struct TapFingerActor {
     pub task_selection: nn::Sequential,
     pub pointer_query: nn::Linear,
+    pub task_encoder: nn::Sequential,
     pub pointer_key: nn::Linear,
     pub cpu_allocator: nn::Sequential,
     pub gpu_allocator: nn::Sequential,

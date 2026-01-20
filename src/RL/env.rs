@@ -1,16 +1,41 @@
+use crate::structures::_graph::*;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use database::low::DatabaseManager;
 use rand::{distributions::Distribution, Rng};
 use rand_distr::Poisson;
 use std::collections::VecDeque;
+use std::collections::VecDeque;
+use tracing::{error, info, warn};
 
 pub struct EdgeMLEnv {
     pub clusters: Vec<EdgeCluster>,
     pub global_task_queue: VecDeque<MLTask>,
     pub current_time: DateTime<Utc>,
     pub timestep: usize,
-    pub completed_tasks: Vec<CompletedTask>,
+    pub completed_tasks: VecDeque<CompletedTask>,
     pub config: EnvironmentConfig,
     rng: rand::rngs::ThreadRng,
+    pub db: Option<Arc<DatabaseManager>>,
+    max_completed_history: usize,
+    failed_tasks: Vec<FailedTask>,
+    cluster_health: Vec<ClusterHealth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterHealth {
+    pub cluster_id: usize,
+    pub is_healthy: bool,
+    pub consecutive_failures: usize,
+    pub last_failure: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedTask {
+    pub task: MLTask,
+    pub cluster_id: usize,
+    pub failure_reason: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -22,6 +47,7 @@ pub struct EdgeCluster {
     pub bandwidth_mbps: f64,
     pub pending_tasks: VecDeque<MLTask>,
     pub running_tasks: Vec<RunningTask>,
+    pub resources: ClusterResources, 
 }
 
 pub struct SchedulingContext {
@@ -58,8 +84,8 @@ pub struct GPU {
     pub memory_total_mb: usize,
 }
 
-#[derive(Debug , Clone)]
-pub struct CPU{
+#[derive(Debug, Clone)]
+pub struct CPU {
     pub id: usize,
     pub core_available: usize,
     pub core_total: usize,
@@ -67,9 +93,9 @@ pub struct CPU{
     pub memory_total_mb: usize,
 }
 
-impl CPU{
-    pub fn new(id: String) -> Self{
-        Self{
+impl CPU {
+    pub fn new(id: String) -> Self {
+        Self {
             id,
             core_available: 100,
             core_total: 100,
@@ -127,7 +153,6 @@ pub struct ResourceSensitivity {
     pub memory_scaling: f32,
 }
 
-
 #[derive(Clone, Debug)]
 pub struct RunningTask {
     pub task: MLTask,
@@ -176,9 +201,18 @@ impl Default for EnvironmentConfig {
 }
 
 impl EdgeMLEnv {
-    pub fn new(config: EnvironmentConfig) -> Self {
+    pub fn new(config: EnvironmentConfig, db: Arc<DatabaseManager>) -> Self {
         let clusters = (0..config.num_clusters)
             .map(|id| EdgeCluster::new(id, &config))
+            .collect();
+
+        let cluster_health = (0..config.num_clusters)
+            .map(|id| ClusterHealth {
+                cluster_id: id,
+                is_healthy: true,
+                consecutive_failures: 0,
+                last_failure: None,
+            })
             .collect();
 
         Self {
@@ -186,80 +220,97 @@ impl EdgeMLEnv {
             global_task_queue: VecDeque::new(),
             current_time: Utc::now(),
             timestep: 0,
-            completed_tasks: Vec::new(),
+            completed_tasks: VecDeque::new(),
             config,
             rng: rand::thread_rng(),
+            db: Some(db),
+            max_completed_history: 1000,
+            failed_tasks: Vec::new(),
+            cluster_health,
         }
     }
 
-    pub fn build_obs(&self) -> SchedulingContext{
+    pub fn build_mcts_obs(&self) -> SchedulingContext {
         let mut graph = HanGraph::new();
         let mut task_lookup = TaskLookup::new();
         let mut cluster_resources = ClusterResources::default();
 
-        for (cluster_idx , cluster) in self.clusters.iter().enumerate(){
-            for task in &cluster.pending_tasks{
-                let node_idx = graph.add_pending_task(task.to_features()); //Need to add this into Graph struct 
-                task_lookup.insert(node_idx, TaskInfo {
+        for (cluster_idx, cluster) in self.clusters.iter().enumerate() {
+            for task in &cluster.pending_tasks {
+                let node_idx = graph.add_pending_task(task.to_features()); //Need to add this into Graph struct
+                task_lookup.insert(
+                    node_idx,
+                    TaskInfo {
+                        task_id: task.id.clone(),
+                        min_cpu: task.min_cpu,
+                        min_gpu_core: task.min_gpu_core,
+                        min_gpu_memory: task.min_gpu_memory,
+                        min_memory_mb: task.min_memory_mb,
+                        task_type: task.task_type,
+                    },
+                );
+            }
+            cluster_resources.cpu_available = cluster
+                .cpus
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.core_available > 0)
+                .map(|(i, _)| i)
+                .collect();
+
+            cluster_resources.gpu_available = cluster
+                .gpus
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| g.core_available > 0)
+                .map(|(i, _)| i)
+                .collect();
+
+            cluster_resources.memory_available = cluster.memory_mb
+        }
+
+        SchedulingContext {
+            graph: graph.to_tensor(device),
+            task_lookup,
+            cluster_resources,
+        }
+    }
+
+    pub fn build_scheduling_context(&self, cluster_idx: usize) -> SchedulingContext {
+        let mut graph = HANGraph::new();
+        let mut task_lookup = HashMap::new();
+        let cluster = &self.clusters[cluster_idx];
+
+        let cluster_to_node_idx = graph.add_cluster(cluster.to_features()) as i64;
+
+        let cluster_resources = ClusterResources {
+            cpu_available: cluster.cpu_cores.available,
+            gpu_available: cluster.gpus.iter().map(|g| g.core_available).collect(),
+            memory_available: cluster.memory_mb.available,
+        };
+
+        for task in cluster
+            .pending_task
+            .iter()
+            .take(self.config.max_pending_set_size)
+        {
+            let node_idx = graph.add_pending_task(task.to_features()) as i64;
+
+            task_lookup.insert(
+                node_idx,
+                TaskInfo {
                     task_id: task.id.clone(),
                     min_cpu: task.min_cpu,
                     min_gpu_core: task.min_gpu_core,
                     min_gpu_memory: task.min_gpu_memory,
                     min_memory_mb: task.min_memory_mb,
                     task_type: task.task_type,
-                });
-            }
-            cluster_resources.cpu_available = cluster.cpus.iter()
-                .enumerate()
-                .filter(|(_, c)| c.core_available > 0)
-                .map(|(i , _)| i)
-                .collect();
-            
-            cluster_resources.gpu_available = cluster.gpus.iter()
-                .enumerate()
-                .filter(|(_, g)| g.core_available > 0)
-                .map(|(i, _)| i)
-                .collect();
-            
-            cluster_resources.memory_available = cluster.memory_mb
-            }
-            
-            SchedulingContext {
-                graph: graph.to_tensor(device),
-                task_lookup,
-                cluster_resources,
-            }
-        }
-    }
-    
-    pub fn build_scheduling_context(&self , cluster_idx: usize) -> SchedulingContext{
-        let mut graph = HANGraph::new();
-        let mut task_lookup = HashMap::new();
-        let cluster = &self.clusters[cluster_idx];
-        
-        let cluster_to_node_idx = graph.add_cluster(cluster.to_features()) as i64; 
-        
-        let cluster_resources = ClusterResources{
-            cpu_available: cluster.cpu_cores.available,
-            gpu_available: cluster.gpus.iter().map(|g| g.core_available).collect(),
-            memory_available: cluster.memory_mb.available,
-        };
-        
-        for task in cluster.pending_task.iter().take(self.config.max_pending_set_size){
-            let node_idx = graph.add_pending_task(task.to_features()) as i64;
-            
-            task_lookup.insert(node_idx, TaskInfo {
-                task_id: task.id.clone(),
-                min_cpu: task.min_cpu,
-                min_gpu_core: task.min_gpu_core,
-                min_gpu_memory: task.min_gpu_memory,
-                min_memory_mb: task.min_memory_mb,
-                task_type: task.task_type,
-            });
-                        
+                },
+            );
+
             graph.connect_task_to_cluster(node_idx as usize, cluster_node_idx as usize);
         }
-        
+
         SchedulingContext {
             graph: graph.to_tensors(), // Convert graph to tch::Tensors
             task_lookup: TaskLookup { tasks: task_lookup },
@@ -422,44 +473,59 @@ impl EdgeMLEnv {
         }
     }
 
-    fn apply_actions(&mut self, actions: Vec<AgentAction>) {
+    pub fn apply_actions(&mut self, actions: Vec<AgentAction>) -> Result<Vec<String>> {
+        let mut scheduled_tasks = Vec::new();
+        let mut rollback_stack = Vec::new();
+
         for (cluster_id, action) in actions.iter().enumerate() {
             if cluster_id >= self.clusters.len() {
+                continue;
+            }
+
+            // Check cluster health
+            if !self.cluster_health[cluster_id].is_healthy {
+                warn!("Cluster {} is unhealthy, skipping", cluster_id);
                 continue;
             }
 
             if let Some(ref task_id) = action.selected_task {
                 let cluster = &mut self.clusters[cluster_id];
 
-                // Find and remove task from pending queue
+                // Validate resources BEFORE allocation
+                if !self.validate_resources(cluster_id, action) {
+                    warn!("Invalid resource allocation for cluster {}", cluster_id);
+                    continue;
+                }
+
+                // Find and remove task
                 if let Some(pos) = cluster.pending_tasks.iter().position(|t| &t.id == task_id) {
                     let task = cluster.pending_tasks.remove(pos).unwrap();
 
-                    // Create running task with allocated resources
-                    let running = RunningTask {
-                        task,
-                        allocated_cpu: action.allocated_cpu,
-                        allocated_gpu_id: action.allocated_gpu_id,
-                        allocated_gpu_cores: action.allocated_gpu_cores,
-                        allocated_memory_mb: action.allocated_memory_mb,
-                        start_time: self.current_time,
-                        progress: 0.0,
-                    };
+                    // Try to allocate resources
+                    match self.allocate_resources(cluster_id, action, &task) {
+                        Ok(running_task) => {
+                            rollback_stack.push((cluster_id, task.clone()));
+                            cluster.running_tasks.push(running_task);
+                            scheduled_tasks.push(task_id.clone());
+                        }
+                        Err(e) => {
+                            // Rollback: put task back
+                            cluster.pending_tasks.push_front(task);
+                            error!("Failed to allocate resources: {}", e);
 
-                    // Allocate resources
-                    cluster.cpu_cores.available -= action.allocated_cpu;
-                    if let Some(gpu_id) = action.allocated_gpu_id {
-                        if gpu_id < cluster.gpus.len() {
-                            cluster.gpus[gpu_id].core_available -= action.allocated_gpu_cores;
-                            cluster.gpus[gpu_id].memory_available_mb -= running.task.min_gpu_memory;
+                            // Track failure
+                            self.cluster_health[cluster_id].consecutive_failures += 1;
+                            if self.cluster_health[cluster_id].consecutive_failures > 5 {
+                                self.cluster_health[cluster_id].is_healthy = false;
+                                error!("Cluster {} marked unhealthy", cluster_id);
+                            }
                         }
                     }
-                    cluster.memory_mb.available -= action.allocated_memory_mb;
-
-                    cluster.running_tasks.push(running);
                 }
             }
         }
+
+        Ok(scheduled_tasks)
     }
 
     fn execute_tasks(&mut self) {
@@ -542,8 +608,6 @@ impl EdgeMLEnv {
     }
 
     fn build_observation(&self) -> HANGraph {
-        use crate::utils::graph::*;
-
         let mut graph = HANGraph::new();
 
         // Add cluster nodes
@@ -612,6 +676,52 @@ impl EdgeMLEnv {
                 .sum::<usize>() as f64,
         );
         info
+    }
+
+    fn validate_resources(&self, cluster_id: usize, action: &AgentAction) -> bool {
+        let cluster = &self.clusters[cluster_id];
+
+        // Check CPU
+        let total_cpu_available: usize = cluster.cpus.iter().map(|c| c.core_available).sum();
+        if action.allocated_cpu > total_cpu_available {
+            return false;
+        }
+
+        // Check GPU
+        if let Some(gpu_id) = action.allocated_gpu_id {
+            if gpu_id >= cluster.gpus.len() {
+                return false;
+            }
+            if action.allocated_gpu_cores > cluster.gpus[gpu_id].core_available {
+                return false;
+            }
+        }
+
+        // Check Memory
+        let total_memory: usize = cluster.cpus.iter().map(|c| c.memory_available_mb).sum();
+        if action.allocated_memory_mb > total_memory {
+            return false;
+        }
+
+        true
+    }
+
+    fn allocate_resources(
+        &mut self,
+        cluster_id: usize,
+        action: &ResourceAction,
+        task: &MLTask,
+    ) -> Result<RunningTask> {
+
+        let cluster = &mut self.clusters[cluster_id];
+
+        let mut cpu_allocated = 0;
+        for cpu in &mut cluster.cpus{
+            if cpu >= action.cpu{ 
+                break;
+            }
+            let can_allocate = cpu.resources.cpu_available.min(action.)
+        }
     }
 }
 

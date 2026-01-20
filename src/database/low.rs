@@ -240,12 +240,74 @@ impl StorageLayer for PostgresStorage {
         .await?;
         Ok(metrics)
     }
+
+    pub async fn get_job_statistics(&self, hours: i64) -> Result<JobStatistics> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
+
+        let stats = sqlx::query!(
+            r#"
+            SELECT
+                COUNT(*) as total_jobs,
+                AVG(execution_time_sec) as avg_execution_time,
+                AVG(queue_wait_time_sec) as avg_wait_time,
+                COUNT(*) FILTER (WHERE status = 'completed') as completed_jobs,
+                COUNT(*) FILTER (WHERE status = 'failed') as failed_jobs
+            FROM jobs
+            WHERE arrival_time > $1
+            "#,
+            cutoff
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(JobStatistics {
+            total_jobs: stats.total_jobs.unwrap_or(0),
+            avg_execution_time: stats.avg_execution_time.unwrap_or(0.0) as f32,
+            avg_wait_time: stats.avg_wait_time.unwrap_or(0.0) as f32,
+            completed_jobs: stats.completed_jobs.unwrap_or(0),
+            failed_jobs: stats.failed_jobs.unwrap_or(0),
+        })
+    }
+
+    pub async fn get_cluster_utilization_history(
+        &self,
+        cluster_id: i32,
+        hours: i64,
+    ) -> Result<Vec<ClusterMetrics>> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
+
+        let metrics = sqlx::query_as!(
+            ClusterMetrics,
+            r#"
+            SELECT * FROM cluster_metrics
+            WHERE cluster_id = $1 AND timestamp > $2
+            ORDER BY timestamp ASC
+            "#,
+            cluster_id,
+            cutoff
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(metrics)
+    }
+
+    //TODO: implement more
 }
 
 pub struct CacheStorage {
     client: RedisClient,
     ttl_seconds: i64,
     cache_type: String, // "valkey"
+}
+
+#[derive(Debug)]
+pub struct JobStatistics {
+    pub total_jobs: i64,
+    pub avg_execution_time: f32,
+    pub avg_wait_time: f32,
+    pub completed_jobs: i64,
+    pub failed_jobs: i64,
 }
 
 impl CacheStorage {
@@ -307,13 +369,208 @@ impl CacheStorage {
         }
     }
 
-    pub async fn get_children_node(&self , parent_id: &str) -> Result<Option<MCTSNodeData>>{
-        let key = format!("mcts.parentnode{}" , parent_id);
+    pub async fn get_children_node(&self, parent_id: &str) -> Result<Option<MCTSNodeData>> {
+        let key = format!("mcts.parentnode{}", parent_id);
         let value: Vec<String> = self.client.smembers(&key).await?;
         Ok(value)
     }
 
-    pub async fn
+    pub async fn update_node_stats(
+        &self,
+        node_id: &str,
+        visit_count: usize,
+        total_value: f64,
+    ) -> Result<()> {
+        let key = format!("mcts:node:{}", node_id);
+        if let Some(mut node) = self.get_mcts_node(node_id).await? {
+            node.visit_count = visit_count;
+            node.total_value = total_value;
+            self.store_mcts_node(&node).await?;
+        }
 
+        Ok(())
+    }
 
+    pub async fn cache_scheduling_state(
+        &self,
+        cluster_id: usize,
+        state: &SchedulingStateCache,
+    ) -> Result<()> {
+        let key = format!("state:cluster:{}", cluster_id);
+        let value = serde_json::to_string(state)?;
+        self.client
+            .set(&key, value, Some(Expiration::EX(300)), None, false)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_scheduling_state(
+        &self,
+        cluster_id: usize,
+    ) -> Result<Option<SchedulingStateCache>> {
+        let key = format!("state:cluster:{}", cluster_id);
+        let value: Option<String> = self.client.get(&key).await?;
+
+        match value {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    // Active job tracking
+    pub async fn add_active_job(&self, cluster_id: usize, job_id: &str) -> Result<()> {
+        let key = format!("active:cluster:{}", cluster_id);
+        self.client.sadd(&key, job_id).await?;
+        Ok(())
+    }
+
+    pub async fn remove_active_job(&self, cluster_id: usize, job_id: &str) -> Result<()> {
+        let key = format!("active:cluster:{}", cluster_id);
+        self.client.srem(&key, job_id).await?;
+        Ok(())
+    }
+
+    pub async fn get_active_jobs(&self, cluster_id: usize) -> Result<Vec<String>> {
+        let key = format!("active:cluster:{}", cluster_id);
+        let jobs: Vec<String> = self.client.smembers(&key).await?;
+        Ok(jobs)
+    }
+
+    pub fn cache_type(&self) -> &str {
+        &self.cache_type
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingStateCache {
+    pub cluster_id: usize,
+    pub cpu_available: usize,
+    pub gpu_states: Vec<GPUStateCache>,
+    pub queue_length: usize,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GPUStateCache {
+    pub gpu_id: usize,
+    pub core_available: usize,
+    pub memory_available_mb: usize,
+}
+
+pub struct DatabaseManager {
+    pub postgres: Arc<PostgresStorage>,
+    pub cache: Arc<CacheStorage>,
+}
+
+impl DatabaseManager {
+    /// # Example with Valkey
+    /// ```rust
+    /// let db = DatabaseManager::new(
+    ///     "postgres://user:pass@localhost/scheduler",
+    ///     "valkey://localhost:6379"  // or use default Valkey port
+    /// ).await?;
+
+    pub async fn new(postgres_url: &str, cache_url: &str) -> Result<Self> {
+        let postgres = Arc::new(PostgresStorage::new(postgres_url).await?);
+        postgres.initialize().await?;
+
+        let cache = Arc::new(CacheStorage::new(cache_url, 3600).await?);
+
+        println!(
+            "Database initialized with {} cache backend",
+            cache.cache_type()
+        );
+
+        Ok(Self { postgres, cache })
+    }
+
+    pub async fn record_job_start(&self, job: &JobRecord) -> Result<()> {
+        // Store in Postgres for long-term record
+        self.postgres.store_job(job).await?;
+
+        // Add to active jobs in cache
+        self.cache
+            .add_active_job(job.cluster_id as usize, &job.job_id)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn record_job_completion(
+        &self,
+        job_id: &str,
+        cluster_id: usize,
+        completion_time: chrono::DateTime<chrono::Utc>,
+        execution_time_sec: f32,
+    ) -> Result<()> {
+        // Update in Postgres
+        sqlx::query!(
+            r#"
+            UPDATE jobs
+            SET status = 'completed',
+                completion_time = $1,
+                execution_time_sec = $2
+            WHERE job_id = $3
+            "#,
+            completion_time,
+            execution_time_sec,
+            job_id
+        )
+        .execute(&self.postgres.pool)
+        .await?;
+
+        // Remove from active jobs in cache
+        self.cache.remove_active_job(cluster_id, job_id).await?;
+
+        Ok(())
+    }
+
+    pub async fn store_metrics_with_cache(&self, metrics: &ClusterMetrics) -> Result<()> {
+        self.postgres.store_metrics(metrics).await?;
+
+        let state = SchedulingStateCache {
+            cluster_id: metrics.cluster_id as usize,
+            cpu_available: (100.0 - metrics.cpu_utilization) as usize,
+            gpu_states: vec![],
+            queue_length: metrics.queue_length as usize,
+            timestamp: metrics.timestamp,
+        };
+
+        self.cache
+            .cache_scheduling_state(metrics.cluster_id as usize, &state)
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_with_valkey() -> Result<()> {
+        // Using Valkey (Linux Foundation, truly open source)
+        let db = DatabaseManager::new(
+            "postgres://user:pass@localhost/scheduler",
+            "valkey://localhost:6379",
+        )
+        .await?;
+
+        assert_eq!(db.cache.cache_type(), "valkey");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_with_dragonfly() -> Result<()> {
+        // Using DragonflyDB (MIT licensed, 25x faster)
+        let db = DatabaseManager::new(
+            "postgres://user:pass@localhost/scheduler",
+            "dragonfly://localhost:6379",
+        )
+        .await?;
+
+        assert_eq!(db.cache.cache_type(), "dragonfly");
+        Ok(())
+    }
 }
