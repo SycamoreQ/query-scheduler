@@ -213,6 +213,239 @@ pub struct MCTSNode {
     pub total_value: f64,
 }
 
+// Fixed MCTS implementation and complete training loop
+
+use actor::TapFingerActor;
+use anyhow::Result;
+use critic::TapFingerCritic;
+use env::EdgeMLEnv;
+use std::collections::HashMap;
+use std::sync::Arc;
+use structures::_graph::GraphTensors;
+use tch::{nn, Device, IndexOp, Kind, Tensor};
+use tracing::{info, warn};
+
+// ============================================================================
+// FIXED WORLD MODEL
+// ============================================================================
+
+pub struct WorldModel {
+    representation_net: nn::Sequential,
+    action_encoder: nn::Linear, // FIX: Added missing field
+    dynamics_net: nn::Sequential,
+    reward_net: nn::Sequential,
+    value_net: nn::Sequential,
+    pub hidden_dim: i64, // FIX: Made public
+}
+
+impl WorldModel {
+    pub fn new(vs: &nn::Path, state_dim: i64, action_dim: i64, hidden_dim: i64) -> Self {
+        let representation_net = nn::seq()
+            .add(nn::linear(
+                vs / "repr_1",
+                state_dim,
+                hidden_dim * 2,
+                Default::default(),
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::linear(
+                vs / "repr_2",
+                hidden_dim * 2,
+                hidden_dim,
+                Default::default(),
+            ))
+            .add_fn(|x| x.tanh());
+
+        // FIX: Action encoder for projecting discrete actions
+        let action_encoder = nn::linear(
+            vs / "action_enc",
+            action_dim,
+            hidden_dim / 4,
+            Default::default(),
+        );
+
+        let dynamics_net = nn::seq()
+            .add(nn::linear(
+                vs / "dyn_1",
+                hidden_dim + hidden_dim / 4,
+                hidden_dim * 2,
+                Default::default(),
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::linear(
+                vs / "dyn_2",
+                hidden_dim * 2,
+                hidden_dim,
+                Default::default(),
+            ))
+            .add_fn(|x| x.tanh());
+
+        let reward_net = nn::seq()
+            .add(nn::linear(
+                vs / "rew_1",
+                hidden_dim,
+                128,
+                Default::default(),
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::linear(vs / "rew_2", 128, 1, Default::default()));
+
+        let value_net = nn::seq()
+            .add(nn::linear(
+                vs / "val_1",
+                hidden_dim,
+                128,
+                Default::default(),
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::linear(vs / "val_2", 128, 1, Default::default()));
+
+        Self {
+            representation_net,
+            action_encoder,
+            dynamics_net,
+            reward_net,
+            value_net,
+            hidden_dim,
+        }
+    }
+
+    pub fn represent(&self, state: &Tensor) -> Tensor {
+        self.representation_net.forward(state)
+    }
+
+    pub fn step(&self, latent_state: &Tensor, action: &ActionKey) -> WorldModelOutput {
+        let device = latent_state.device();
+
+        // Convert action to tensor
+        let action_data = vec![
+            action.task_idx as f32 / 100.0,
+            action.cpu_bin as f32 / 16.0,
+            action.gpu_idx as f32 / 8.0,
+            action.mem_bin as f32 / 20.0,
+        ];
+        let action_tensor = Tensor::of_slice(&action_data).to_device(device);
+
+        // Encode action
+        let action_proj = self.action_encoder.forward(&action_tensor);
+
+        // Predict next state
+        let dyn_input = Tensor::cat(&[latent_state, &action_proj], -1);
+        let next_latent = self.dynamics_net.forward(&dyn_input);
+
+        // Predict reward and value
+        let reward = self.reward_net.forward(&next_latent);
+        let value = self.value_net.forward(&next_latent);
+
+        WorldModelOutput {
+            next_latent_state: next_latent,
+            reward,
+            value,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WorldModelOutput {
+    pub next_latent_state: Tensor,
+    pub reward: Tensor,
+    pub value: Tensor,
+}
+
+// ============================================================================
+// FIXED MCTS NODE
+// ============================================================================
+
+pub struct MCTSNode {
+    pub latent_state: Tensor,
+    pub parent: Option<Arc<Mutex<MCTSNode>>>,
+    pub children: HashMap<ActionKey, Arc<Mutex<MCTSNode>>>,
+    pub visit_count: usize,
+    pub total_value: f64,
+    pub prior_prob: f64,
+    pub action: Option<ActionKey>,
+    pub reward: f64, // FIX: Removed duplicate total_value field
+}
+
+impl MCTSNode {
+    pub fn new(latent_state: Tensor) -> Self {
+        Self {
+            latent_state,
+            parent: None,
+            children: HashMap::new(),
+            visit_count: 0,
+            total_value: 0.0,
+            prior_prob: 1.0,
+            action: None,
+            reward: 0.0,
+        }
+    }
+
+    pub fn q_value(&self) -> f64 {
+        if self.visit_count == 0 {
+            0.0
+        } else {
+            self.total_value / self.visit_count as f64
+        }
+    }
+
+    pub fn ucb_score(&self, parent_visits: usize, c_puct: f64) -> f64 {
+        let exploitation = self.q_value();
+        let exploration = c_puct * self.prior_prob * (parent_visits as f64).sqrt()
+            / (1.0 + self.visit_count as f64);
+        exploitation + exploration
+    }
+
+    pub fn select_child(&self, c_puct: f64) -> Option<(ActionKey, Arc<Mutex<MCTSNode>>)> {
+        if self.children.is_empty() {
+            return None;
+        }
+
+        let parent_visits = self.visit_count;
+
+        self.children
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                let score_a = a.lock().unwrap().ucb_score(parent_visits, c_puct);
+                let score_b = b.lock().unwrap().ucb_score(parent_visits, c_puct);
+                score_a.partial_cmp(&score_b).unwrap()
+            })
+            .map(|(action, node)| (action.clone(), Arc::clone(node)))
+    }
+
+    pub fn add_child(
+        &mut self,
+        action: ActionKey,
+        child_latent: Tensor,
+        prior: f64,
+        reward: f64,
+    ) -> Arc<Mutex<MCTSNode>> {
+        let child = MCTSNode {
+            latent_state: child_latent,
+            parent: None,
+            children: HashMap::new(),
+            reward,
+            visit_count: 0,
+            total_value: 0.0,
+            prior_prob: prior,
+            action: Some(action.clone()),
+        };
+
+        let child_ref = Arc::new(Mutex::new(child));
+        self.children.insert(action, Arc::clone(&child_ref));
+        child_ref
+    }
+
+    pub fn backpropagate(&mut self, value: f64) {
+        self.visit_count += 1;
+        self.total_value += value;
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ActionKey {
     pub task_idx: i64,
@@ -222,23 +455,12 @@ pub struct ActionKey {
 }
 
 impl ActionKey {
-    pub fn from_tensor(task_action: &Tensor, resource_action: &Option<ResourceAction>) -> Self {
-        let task_idx = i64::try_from(task_action).unwrap_or(0);
-
-        if let Some(res) = resource_action {
-            Self {
-                task_idx,
-                cpu_bin: i64::try_from(&res.cpu).unwrap_or(0),
-                gpu_idx: i64::try_from(&res.gpu).unwrap_or(0),
-                mem_bin: i64::try_from(&res.memory).unwrap_or(0),
-            }
-        } else {
-            Self {
-                task_idx,
-                cpu_bin: 0,
-                gpu_idx: 0,
-                mem_bin: 0,
-            }
+    pub fn no_op() -> Self {
+        Self {
+            task_idx: 0,
+            cpu_bin: 0,
+            gpu_idx: 0,
+            mem_bin: 0,
         }
     }
 
@@ -251,26 +473,27 @@ impl ActionKey {
         ])
         .to_device(device)
     }
+
     pub fn is_valid(&self, info: &TaskInfo, cluster: &ClusterResources) -> bool {
         if self.task_idx == 0 {
-            return true;
-        } // No-op is always valid
+            return true; // No-op is always valid
+        }
 
         // CPU Check
         if (self.cpu_bin as usize) < info.min_cpu || self.cpu_bin as usize > cluster.cpu_available {
             return false;
         }
 
-        // GPU Check: Check the specific GPU index chosen
+        // GPU Check
         if let Some(&available_cores) = cluster.gpu_available.get(self.gpu_idx as usize) {
             if available_cores < info.min_gpu_core {
                 return false;
             }
         } else {
-            return false; // Invalid GPU index
+            return false;
         }
 
-        // Memory Checo
+        // Memory Check
         if (self.mem_bin as usize) < info.min_memory_mb
             || self.mem_bin as usize > cluster.memory_available
         {
